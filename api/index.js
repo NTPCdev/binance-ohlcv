@@ -2,6 +2,8 @@
 import 'dotenv/config';                        // loads .env locally
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -26,38 +28,64 @@ async function fetchKlines(symbol, startTime, endTime) {
     url.searchParams.set('limit', '1000');
 
     console.log(`  → [${symbol}] fetching ${new Date(cursor).toISOString()} → ${new Date(chunkEnd).toISOString()}`);
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      console.warn(`    ! Failed to fetch klines for ${symbol}: ${resp.status} ${resp.statusText}`);
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        console.warn(`    ! Failed to fetch klines for ${symbol}: ${resp.status} ${resp.statusText}`);
+        break;
+      }
+      const klines = await resp.json();
+      if (!Array.isArray(klines)) {
+        console.warn(`    ! Unexpected klines response for ${symbol}:`, klines);
+        break;
+      }
+      all.push(...klines);
+      if (klines.length < 1000) break; // no more data
+      cursor = klines[klines.length - 1][0] + ONE_DAY_MS;
+    } catch (err) {
+      console.warn(`    ! Error fetching klines for ${symbol}: ${err.message}`);
       break;
     }
-    const klines = await resp.json();
-    if (!Array.isArray(klines)) {
-      console.warn(`    ! Unexpected klines response for ${symbol}:`, klines);
-      break;
-    }
-    all.push(...klines);
-    if (klines.length < 1000) break;            // no more data
-    cursor = klines[klines.length - 1][0] + ONE_DAY_MS; 
   }
   return all;
 }
 
 export default async function handler(_, res) {
-  try {
-    console.log('=== START BINANCE OHLCV SYNC ===');
+  console.log('=== START BINANCE OHLCV SYNC ===');
 
-    // 1) load and validate exchangeInfo once
+  // 1) load and validate exchangeInfo once
+  let validPairs = null;
+  try {
     const respInfo = await fetch('https://api.binance.com/api/v3/exchangeInfo');
     if (!respInfo.ok) {
-      throw new Error(`Binance exchangeInfo fetch failed: ${respInfo.status} ${respInfo.statusText}`);
+      console.warn(`Binance exchangeInfo fetch failed: ${respInfo.status} ${respInfo.statusText}`);
+      throw new Error('Use local fallback');
     }
     const exchangeInfo = await respInfo.json();
-    if (!exchangeInfo.symbols || !Array.isArray(exchangeInfo.symbols)) {
-      throw new Error(`Invalid exchangeInfo structure: ${JSON.stringify(exchangeInfo)}`);
+    if (exchangeInfo.symbols && Array.isArray(exchangeInfo.symbols)) {
+      validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
+      console.log('Loaded validPairs from Binance API');
+    } else {
+      throw new Error('Invalid structure');
     }
-    const validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
+  } catch (err) {
+    console.warn('Falling back to local exchangeInfo.json:', err.message);
+    try {
+      const filePath = join(process.cwd(), 'exchangeInfo.json');
+      const file = await readFile(filePath, 'utf8');
+      const exchangeInfo = JSON.parse(file);
+      if (exchangeInfo.symbols && Array.isArray(exchangeInfo.symbols)) {
+        validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
+        console.log('Loaded validPairs from local exchangeInfo.json');
+      } else {
+        console.warn('Local exchangeInfo.json has invalid structure.');
+      }
+    } catch (fileErr) {
+      console.warn('Failed to load local exchangeInfo.json:', fileErr.message);
+    }
+  }
 
+  try {
     // 2) load top 1000 snapshots by market_cap
     const { data: snaps, error: snapErr } = await supabase
       .from('snapshot')
@@ -71,8 +99,8 @@ export default async function handler(_, res) {
     const pairs = snaps
       .filter(s => !EXCLUDED_KEYWORDS.some(k => s.name.toLowerCase().includes(k)))
       .map(s => s.symbol.toUpperCase() + 'USDT')
-      .filter(sym => validPairs.has(sym));
-    console.log(`→ ${pairs.length} valid USDT pairs after filtering.`);
+      .filter(sym => validPairs ? validPairs.has(sym) : true);
+    console.log(`→ ${pairs.length} target pairs after filtering.`);
 
     const now = Date.now();
     const globalStart = now - FIVE_YEARS_MS;
@@ -96,7 +124,6 @@ export default async function handler(_, res) {
 
       // B) decide backfill & update windows
       const tasks = [];
-
       if (!earliestMs) {
         tasks.push({ from: globalStart, to: now });
         console.log(`  • No existing data; will fetch full 5y→now.`);
@@ -106,7 +133,6 @@ export default async function handler(_, res) {
       } else {
         console.log(`  • No backfill needed.`);
       }
-
       if (latestMs && latestMs + ONE_DAY_MS < now) {
         tasks.push({ from: latestMs + ONE_DAY_MS, to: now });
         console.log(`  • Updating: ${new Date(latestMs + ONE_DAY_MS).toISOString()} → ${new Date(now).toISOString()}`);
@@ -123,13 +149,13 @@ export default async function handler(_, res) {
         }
         const records = klines.map(k => ({
           symbol,
-          open_time:     new Date(k[0]).toISOString(),
-          open:          k[1], high: k[2], low: k[3], close: k[4],
-          volume:        k[5],
-          close_time:    new Date(k[6]).toISOString(),
+          open_time: new Date(k[0]).toISOString(),
+          open: k[1], high: k[2], low: k[3], close: k[4],
+          volume: k[5],
+          close_time: new Date(k[6]).toISOString(),
           quote_asset_volume: k[7],
-          number_of_trades:   k[8],
-          taker_buy_base_volume:  k[9],
+          number_of_trades: k[8],
+          taker_buy_base_volume: k[9],
           taker_buy_quote_volume: k[10],
         }));
         const { error: upErr } = await supabase
