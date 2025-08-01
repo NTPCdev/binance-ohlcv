@@ -1,10 +1,9 @@
-// package.json
 {
   "name": "binance-ohlcv-fetcher",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node api/index.js",    // for local testing
+    "start": "node api/index.js",
     "dev": "nodemon api/index.js"
   },
   "dependencies": {
