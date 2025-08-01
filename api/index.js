@@ -1,5 +1,5 @@
 // /api/index.js
-import 'dotenv/config';
+import 'dotenv/config';                        // loads .env locally
 import fetch from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 
@@ -12,6 +12,7 @@ const EXCLUDED_KEYWORDS = ['wrapped', 'staked', 'WETH'];
 const ONE_DAY_MS      = 24 * 60 * 60 * 1000;
 const FIVE_YEARS_MS   = 5 * 365 * ONE_DAY_MS;  // approx
 
+// helper: fetch klines in [start, end), chunking into <=1000 days
 async function fetchKlines(symbol, startTime, endTime) {
   const all = [];
   let cursor = startTime;
@@ -26,14 +27,18 @@ async function fetchKlines(symbol, startTime, endTime) {
 
     console.log(`  → [${symbol}] fetching ${new Date(cursor).toISOString()} → ${new Date(chunkEnd).toISOString()}`);
     const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(`    ! Failed to fetch klines for ${symbol}: ${resp.status} ${resp.statusText}`);
+      break;
+    }
     const klines = await resp.json();
     if (!Array.isArray(klines)) {
-      console.warn(`    ! Binance error chunk for ${symbol}:`, klines);
+      console.warn(`    ! Unexpected klines response for ${symbol}:`, klines);
       break;
     }
     all.push(...klines);
-    if (klines.length < 1000) break;
-    cursor = klines[klines.length - 1][0] + ONE_DAY_MS;
+    if (klines.length < 1000) break;            // no more data
+    cursor = klines[klines.length - 1][0] + ONE_DAY_MS; 
   }
   return all;
 }
@@ -42,9 +47,15 @@ export default async function handler(_, res) {
   try {
     console.log('=== START BINANCE OHLCV SYNC ===');
 
-    // 1) load exchangeInfo once
-    const exchangeInfo = await fetch('https://api.binance.com/api/v3/exchangeInfo')
-      .then(r => r.json());
+    // 1) load and validate exchangeInfo once
+    const respInfo = await fetch('https://api.binance.com/api/v3/exchangeInfo');
+    if (!respInfo.ok) {
+      throw new Error(`Binance exchangeInfo fetch failed: ${respInfo.status} ${respInfo.statusText}`);
+    }
+    const exchangeInfo = await respInfo.json();
+    if (!exchangeInfo.symbols || !Array.isArray(exchangeInfo.symbols)) {
+      throw new Error(`Invalid exchangeInfo structure: ${JSON.stringify(exchangeInfo)}`);
+    }
     const validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
 
     // 2) load top 1000 snapshots by market_cap
