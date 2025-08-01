@@ -62,26 +62,17 @@ export default async function handler(_, res) {
       throw new Error('Use local fallback');
     }
     const exchangeInfo = await respInfo.json();
-    if (exchangeInfo.symbols && Array.isArray(exchangeInfo.symbols)) {
-      validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
-      console.log('Loaded validPairs from Binance API');
-    } else {
-      throw new Error('Invalid structure');
-    }
-  } catch (err) {
-    console.warn('Falling back to local exchangeInfo.json:', err.message);
+    validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
+    console.log('Loaded validPairs from Binance API');
+  } catch {
+    console.warn('Falling back to local exchangeInfo.json');
     try {
-      const filePath = join(process.cwd(), 'exchangeInfo.json');
-      const file = await readFile(filePath, 'utf8');
+      const file = await readFile(join(process.cwd(), 'exchangeInfo.json'), 'utf8');
       const exchangeInfo = JSON.parse(file);
-      if (exchangeInfo.symbols && Array.isArray(exchangeInfo.symbols)) {
-        validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
-        console.log('Loaded validPairs from local exchangeInfo.json');
-      } else {
-        console.warn('Local exchangeInfo.json has invalid structure.');
-      }
-    } catch (fileErr) {
-      console.warn('Failed to load local exchangeInfo.json:', fileErr.message);
+      validPairs = new Set(exchangeInfo.symbols.map(s => s.symbol));
+      console.log('Loaded validPairs from local exchangeInfo.json');
+    } catch (e) {
+      console.warn('Failed to load local exchangeInfo.json:', e.message);
     }
   }
 
@@ -108,43 +99,46 @@ export default async function handler(_, res) {
     for (const symbol of pairs) {
       console.log(`\n-- Processing ${symbol} --`);
 
-      // A) get existing range in our DB
-      const { data: range, error: rangeErr } = await supabase
+      // A) get earliest & latest from DB
+      let earliestMs = null;
+      let latestMs = null;
+      const { data: early, error: earlyErr } = await supabase
         .from('binance_ohlcv_1d')
-        .select('min(open_time) as earliest, max(open_time) as latest')
+        .select('open_time')
         .eq('symbol', symbol)
+        .order('open_time', { ascending: true })
+        .limit(1)
         .single();
-      if (rangeErr) {
-        console.warn(`  ! Could not get existing range for ${symbol}:`, rangeErr);
-        continue;
-      }
+      if (!earlyErr && early?.open_time) earliestMs = new Date(early.open_time).getTime();
 
-      const earliestMs = range.earliest ? new Date(range.earliest).getTime() : null;
-      const latestMs   = range.latest   ? new Date(range.latest).getTime()   : null;
+      const { data: late, error: lateErr } = await supabase
+        .from('binance_ohlcv_1d')
+        .select('open_time')
+        .eq('symbol', symbol)
+        .order('open_time', { ascending: false })
+        .limit(1)
+        .single();
+      if (!lateErr && late?.open_time) latestMs = new Date(late.open_time).getTime();
 
-      // B) decide backfill & update windows
+      // B) determine backfill & update windows
       const tasks = [];
       if (!earliestMs) {
         tasks.push({ from: globalStart, to: now });
-        console.log(`  • No existing data; will fetch full 5y→now.`);
+        console.log('  • No existing data; full fetch.');
       } else if (earliestMs > globalStart + ONE_DAY_MS) {
         tasks.push({ from: globalStart, to: earliestMs - ONE_DAY_MS });
-        console.log(`  • Backfilling: ${new Date(globalStart).toISOString()} → ${new Date(earliestMs - ONE_DAY_MS).toISOString()}`);
-      } else {
-        console.log(`  • No backfill needed.`);
+        console.log('  • Backfill window:', new Date(globalStart).toISOString(), '→', new Date(earliestMs - ONE_DAY_MS).toISOString());
       }
       if (latestMs && latestMs + ONE_DAY_MS < now) {
         tasks.push({ from: latestMs + ONE_DAY_MS, to: now });
-        console.log(`  • Updating: ${new Date(latestMs + ONE_DAY_MS).toISOString()} → ${new Date(now).toISOString()}`);
-      } else {
-        console.log(`  • No update needed.`);
+        console.log('  • Update window:', new Date(latestMs + ONE_DAY_MS).toISOString(), '→', new Date(now).toISOString());
       }
 
-      // C) run fetch/upsert for each task
+      // C) fetch & upsert
       for (const { from, to } of tasks) {
         const klines = await fetchKlines(symbol, from, to);
         if (!klines.length) {
-          console.log(`    – No data returned for segment.`);
+          console.log('    – No data for segment.');
           continue;
         }
         const records = klines.map(k => ({
@@ -161,11 +155,8 @@ export default async function handler(_, res) {
         const { error: upErr } = await supabase
           .from('binance_ohlcv_1d')
           .upsert(records);
-        if (upErr) {
-          console.error(`    ✖ Upsert failed:`, upErr);
-        } else {
-          console.log(`    ✔ Upserted ${records.length} rows.`);
-        }
+        if (upErr) console.error('    ✖ Upsert failed:', upErr);
+        else console.log(`    ✔ Upserted ${records.length} rows.`);
       }
     }
 
