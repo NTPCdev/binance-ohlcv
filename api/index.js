@@ -167,3 +167,23 @@ export default async function handler(_, res) {
     return res.status(500).json({ error: err.message });
   }
 }
+
+// ----- Mock runner for standalone use -----
+if (import.meta.url === `file://${process.argv[1]}`) {
+  // Simple fake req/res
+  const fakeReq = { method: 'GET' };
+  const fakeRes = {
+    status(code) {
+      this._status = code;
+      return this;
+    },
+    json(payload) {
+      console.log(`\n[MockRunner] ${this._status} →`, payload);
+    },
+    setHeader() {/* noop */}
+  };
+
+  // Run it
+  handler(fakeReq, fakeRes)
+    .catch(err => console.error('[MockRunner] Fatal error:', err));
+}
